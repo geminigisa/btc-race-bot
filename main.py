@@ -1,197 +1,229 @@
-"""Dip-buy swing bot for make.fun "Race a BTC trading bot live for 24 hours".
+"""Bot trading dip-buy swing untuk kompetisi make.fun "Race a BTC trading bot".
 
-Strategy: buy cbBTC on a dip from the rolling N-bar high (with trend / RSI /
-bounce / volatility filters), exit at a take-profit, a stop-loss, a max hold
-time, or a no-recovery cut. One position at a time, 100% of cash per entry,
-at most MAX_TRIPS round trips per window. Standard library only, fully
-deterministic (no clock, no randomness, no environment, no files).
+Strategi
+--------
+Satu posisi long CBBTC/USDC, 100% kas per entry, maksimal 4 trip dalam
+jendela 1440 bar (1 menit). Entry hanya saat harga turun (dip) dari
+tertinggi 45 bar terakhir lalu memantul kembali:
 
-Protocol: agent-fun/bars-replay/v1 via the kit's Python shim (vendor/).
-The harness flattens any open position at the last close, so no exit order
-is needed on done.
+* dip: close turun >= dip_bps (40 bps) dari max close 45 bar terakhir;
+* dip_low dicatat (harga terendah selama fase dip) dan dip_age dihitung;
+* entry butuh close memantul >= bounce_bps (10 bps) di atas dip_low,
+  close harus berada di atas SMA(trend_n=60) (filter tren),
+  dan dip_age tidak boleh melewati dip_max_age (30 bar);
+* filter RSI(14) dan ATR(20) tersedia tapi nonaktif di parameter final
+  (rsi_max dan min_atr_bps bernilai None).
+
+Exit satu posisi, yang mana dulu tercapai:
+
+* take-profit tp_bps (70 bps) di atas cost (atau trailing bila
+  trail_bps diisi), stop-loss sl_bps (50 bps) di bawah cost,
+  max_hold (180 bar), atau norecov (bila diisi: masih rugi setelah
+  norecov_bars bar).
+
+Protokol
+--------
+Berbicara agent-fun/bars-replay/v1 lewat shim vendor: shim membaca
+NDJSON dari stdin (hello, lalu satu batch per menit, lalu done) dan
+memanggil on_batch(state, batch); balasan berupa list order (boleh
+kosong). Satu batch membawa bar yang baru tutup, fills dari order
+batch sebelumnya, dan akun. Order yang diputuskan pada batch menit t
+terisi pada open bar berikutnya.
+
+Determinisme
+------------
+Penuh: tanpa jam dinding, tanpa random, tanpa environment, tanpa file.
+Semua state berasal dari bar, fills, dan state yang dikirim harness.
+Dua eksekusi pada data yang sama menghasilkan order yang sama persis.
+Hanya standard library yang dipakai.
 """
+
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import makefun_bars  # noqa: E402
-import params  # noqa: E402
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+sys.path.insert(0, os.path.join(_HERE, "vendor"))
 
-P = params.P
+import makefun_bars
+
+from params import P
+
 SYMBOL = "CBBTC"
-BPS = 10_000
-MAX_SLIPPAGE_BPS = 100
+BPS = 10000
+WINDOW_BARS = 1440
 
-# ---- series state (closes only; ints) ----
-closes = []          # closes, oldest first (unbounded is fine: 1440 bars)
-highs = []           # bar highs
-lows = []            # bar lows
-first_gain = []      # RSI warm-up changes
-rsi_gain = None      # Wilder avg gain
-rsi_loss = None      # Wilder avg loss
-last_close = None
+# Riwayat harga per bar CBBTC (paralel, indeks sama).
+closes = []
+highs = []
+lows = []
 
-# ---- trade state ----
-trips_started = 0    # buy fills seen
-entry_seq = None     # seq when the current position first appeared
-peak_value = None    # highest position value since entry (for trailing stop)
-dip_low = None       # lowest close since the dip condition first held
-dip_age = 0          # bars since the dip condition first held
-
-
-def push(bar):
-    global last_close, rsi_gain, rsi_loss
-    c = int(bar["c"])
-    h = int(bar["h"])
-    lo = int(bar["l"])
-    closes.append(c)
-    highs.append(h)
-    lows.append(lo)
-    if last_close is not None:
-        ch = c - last_close
-        up = ch if ch > 0 else 0
-        dn = -ch if ch < 0 else 0
-        if rsi_gain is None:
-            first_gain.append(ch)
-            if len(first_gain) == 14:
-                rsi_gain = sum(x for x in first_gain if x > 0) / 14.0
-                rsi_loss = sum(-x for x in first_gain if x < 0) / 14.0
-        else:
-            rsi_gain = (rsi_gain * 13 + up) / 14.0
-            rsi_loss = (rsi_loss * 13 + dn) / 14.0
-    last_close = c
+# State strategi.
+dip_low = None      # close terendah selama fase dip yang sedang berjalan
+dip_age = 0         # berapa bar fase dip sudah berjalan
+trips_started = 0   # berapa buy fill yang sudah diterima
+entry_seq = None    # seq batch saat posisi sekarang mulai dipegang
+peak_value = None   # nilai posisi tertinggi sejak entry (untuk trailing)
 
 
 def sma(n):
+    """Rata-rata close n bar terakhir; None bila bar belum cukup."""
     if len(closes) < n:
         return None
     return sum(closes[-n:]) / float(n)
 
 
-def rsi():
-    if rsi_gain is None:
+def rsi(period=14):
+    """RSI Wilder: 14 perubahan pertama dirata-rata, lalu smoothing
+    (prev * (period - 1) + current) / period. None bila bar belum cukup."""
+    if len(closes) < period + 1:
         return None
-    moved = rsi_gain + rsi_loss
-    return 50.0 if moved == 0 else 100.0 * rsi_gain / moved
+    changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    if len(changes) < period:
+        return None
+    avg_gain = sum(c if c > 0 else 0 for c in changes[:period]) / float(period)
+    avg_loss = sum(-c if c < 0 else 0 for c in changes[:period]) / float(period)
+    for c in changes[period:]:
+        avg_gain = (avg_gain * (period - 1) + (c if c > 0 else 0)) / float(period)
+        avg_loss = (avg_loss * (period - 1) + (-c if c < 0 else 0)) / float(period)
+    total = avg_gain + avg_loss
+    if total == 0:
+        return 50.0
+    return 100.0 * avg_gain / total
 
 
-def atr_bps(n=20):
-    if len(closes) < n:
+def atr_bps(period=20):
+    """ATR dalam bps: rata-rata 20 bar terakhir dari
+    (high - low) * 10000 / close. None bila bar belum cukup."""
+    if len(closes) < period:
         return None
-    tot = 0.0
-    for i in range(len(closes) - n, len(closes)):
-        tot += (highs[i] - lows[i]) * 10000.0 / closes[i]
-    return tot / n
+    total = 0.0
+    for i in range(len(closes) - period, len(closes)):
+        total += (highs[i] - lows[i]) * BPS / closes[i]
+    return total / float(period)
 
 
 def on_batch(state, batch):
-    global trips_started, entry_seq, peak_value, dip_low, dip_age
-    fresh = False
-    for bar in batch["bars"]:
-        if bar["symbol"] == SYMBOL:
-            push(bar)
-            fresh = True
-    if not fresh:
-        return []
-    # Count buy fills (a buy starts a round trip) and track position appearance.
-    for f in batch.get("fills", []):
-        if f.get("symbol") == SYMBOL and f.get("status") == "filled" and f.get("side") == "buy":
+    global dip_low, dip_age, trips_started, entry_seq, peak_value
+
+    # 1. Serap semua bar CBBTC dari batch ini (o/h/l/c bisa berupa
+    #    angka atau string angka, jadi pakai int()).
+    for bar in batch.get("bars", []):
+        if bar.get("symbol") != SYMBOL:
+            continue
+        closes.append(int(bar["c"]))
+        highs.append(int(bar["h"]))
+        lows.append(int(bar["l"]))
+
+    # 2. Hitung buy fill: tiap buy yang terisi memulai satu trip.
+    for fill in batch.get("fills", []):
+        if (fill.get("symbol") == SYMBOL
+                and fill.get("status") == "filled"
+                and fill.get("side") == "buy"):
             trips_started += 1
+
+    # 3. Lacak posisi: catat entry_seq dan peak_value saat posisi baru
+    #    muncul; bersihkan saat posisi sudah tidak ada.
     held = state.positions.get(SYMBOL)
-    if held is not None and entry_seq is None:
-        entry_seq = state.seq
-        peak_value = state.value(SYMBOL, held.qty)
-    if held is None:
+    holding = held is not None and held.qty
+    if holding:
+        # Posisi baru pertama kali terlihat pada batch setelah fill buy
+        # dilaporkan, jadi entry_seq menandai batch itu dan bars_held
+        # dihitung dari sana (bukan dari batch saat order dikirim).
+        if entry_seq is None:
+            entry_seq = state.seq
+            peak_value = state.value(SYMBOL, held.qty)
+    else:
         entry_seq = None
         peak_value = None
 
-    seq = state.seq
-    n_bars = len(closes)
-    close = closes[-1]
-
-    # ---- exit logic ----
-    if held is not None:
+    # 4. EXIT: bila sedang memegang posisi.
+    if holding:
         value = state.value(SYMBOL, held.qty)
         cost = held.cost
-        if value > peak_value:
+        if peak_value is None or value > peak_value:
             peak_value = value
-        bars_held = seq - entry_seq if entry_seq is not None else 0
+        bars_held = state.seq - entry_seq
+
         sell = False
         if P["trail_bps"] is not None:
-            # trailing stop: arms once the position reaches TP, then sells
-            # when it falls trail_bps below its peak value
             armed = peak_value * BPS >= cost * (BPS + P["tp_bps"])
             if armed and value * BPS <= peak_value * (BPS - P["trail_bps"]):
                 sell = True
         elif value * BPS >= cost * (BPS + P["tp_bps"]):
             sell = True
-        if P["sl_bps"] is not None and value * BPS <= cost * (BPS - P["sl_bps"]):
-            sell = True
-        elif bars_held >= P["max_hold"]:
-            sell = True
-        elif (P["norecov_bars"] is not None and bars_held >= P["norecov_bars"]
-                and value < cost):
-            sell = True
+        if not sell:
+            if P["sl_bps"] is not None and value * BPS <= cost * (BPS - P["sl_bps"]):
+                sell = True
+            elif bars_held >= P["max_hold"]:
+                sell = True
+            elif (P["norecov_bars"] is not None
+                    and bars_held >= P["norecov_bars"]
+                    and value < cost):
+                sell = True
         if sell:
             return [{"side": "sell", "symbol": SYMBOL, "qty": held.qty,
-                     "max_slippage_bps": MAX_SLIPPAGE_BPS}]
+                     "max_slippage_bps": 100}]
         return []
 
-    # ---- entry logic ----
+    # 5. ENTRY: bila tidak memegang posisi.
     if trips_started >= P["max_trips"]:
         return []
-    if n_bars < P["high_n"]:
+    if len(closes) < P["high_n"]:
         return []
-    # bars remaining in the window: batches are 0..1439; an order on batch k
-    # fills at k+1, so entering later than 1439 - P["no_entry_last"] is useless.
-    if seq >= 1440 - P["no_entry_last"]:
+    if state.seq >= WINDOW_BARS - P["no_entry_last"]:
         return []
-    high_n = max(closes[-P["high_n"]:])
-    dip = close * BPS <= high_n * (BPS - P["dip_bps"])
+
+    close = closes[-1]
+    high_n_val = max(closes[-P["high_n"]:])
+    dip = close * BPS <= high_n_val * (BPS - P["dip_bps"])
     if dip:
         if dip_low is None:
             dip_low = close
             dip_age = 0
         else:
-            dip_low = min(dip_low, close)
+            if close < dip_low:
+                dip_low = close
             dip_age += 1
     else:
-        # Recovered above the dip line: reset the dip tracker.
-        if close * BPS > high_n * (BPS - P["dip_bps"] // 2):
+        # Bukan dip: bila harga sudah kembali dekat ke tertinggi,
+        # fase dip dianggap selesai dan pelacakan direset.
+        if close * BPS > high_n_val * (BPS - P["dip_bps"] // 2):
             dip_low = None
             dip_age = 0
         return []
     if dip_age > P["dip_max_age"]:
         return []
-    # trend filter
+
+    # Filter tren: close harus di atas SMA(trend_n).
     if P["trend_n"] is not None:
-        t = sma(P["trend_n"])
-        if t is None or close < t:
+        trend = sma(P["trend_n"])
+        if trend is None or close < trend:
             return []
-    # RSI filter
+
+    # Filter RSI: RSI harus di bawah rsi_max (nonaktif bila None).
     if P["rsi_max"] is not None:
-        r = rsi()
+        r = rsi(14)
         if r is None or r > P["rsi_max"]:
             return []
-    # volatility gate (ATR in bps over the last 20 bars)
+
+    # Filter ATR: ATR harus di atas min_atr_bps (nonaktif bila None).
     if P["min_atr_bps"] is not None:
         a = atr_bps(20)
         if a is None or a < P["min_atr_bps"]:
             return []
-    # bounce confirmation: enter only once the price has bounced off the dip low
+
+    # Konfirmasi pantulan: close harus naik bounce_bps di atas dip_low.
     if P["bounce_bps"] is not None:
         if close * BPS < dip_low * (BPS + P["bounce_bps"]):
             return []
-    # enter with everything
-    room = state.weight_room(SYMBOL)
-    amount = state.cash
-    if amount > room:
-        amount = room
+
+    # Beli 100% kas (dibatasi weight_room), selama di atas notional minimum.
+    amount = min(state.cash, state.weight_room(SYMBOL))
     if amount < int(state.hello["fees"]["min_notional_quote_units"]):
         return []
-    return [{"side": "buy", "symbol": SYMBOL, "notional_quote_units": amount,
-             "max_slippage_bps": MAX_SLIPPAGE_BPS}]
+    return [{"side": "buy", "symbol": SYMBOL,
+             "notional_quote_units": amount, "max_slippage_bps": 100}]
 
 
 makefun_bars.run(on_batch)
